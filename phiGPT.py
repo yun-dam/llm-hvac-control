@@ -90,11 +90,11 @@ class phiGPT:
         distances.sort(key=lambda x: x[0])
         return [x[1] for x in distances[:10]]  # Return 10 closest time series
     
-    def generate_optimized_setpoint(self, current_48h_series, input_features):
+    def generate_optimized_setpoint(self, current_48h_series):
         """Retrieve similar historical sequences and generate HVAC control strategy."""
         similar_sequences = self._find_similar_time_series(current_48h_series)
-        predicted_temp = self.predict_temperature(input_features)
-
+        # predicted_temp = self.predict_temperature(input_features)
+        # - The predicted indoor temperature for the next hour is {predicted_temp:.2f}°F.
         prompt_text = f"""
         You are an AI-powered HVAC optimization assistant. Your task is to analyze historical data and current conditions to recommend an optimal cooling set-point for the next hour.
         
@@ -103,7 +103,7 @@ class phiGPT:
         - The goal is to prevent overcooling while maintaining occupant comfort.
         - You have access to ten historical 48-hour time series that are most similar to the current state.
         - Each time series contains hourly [indoor_air_temperature, cooling_set_point] pairs.
-        - The predicted indoor temperature for the next hour is {predicted_temp:.2f}°F.
+        
         
         Historical Data:
         {similar_sequences}
@@ -113,13 +113,13 @@ class phiGPT:
         
         Instructions:
         1. Analyze the historical sequences and the current sequence.
-        2. Consider the predicted indoor temperature.
-        3. Determine the optimal cooling set-point for the next hour. Set-point should be one of 74, 76, 78 Fahrenheit.
-        4. Provide a brief rationale for your recommendation (1-2 sentences).
-        5. Format your response as a valid Python dictionary.
+        2. Determine the optimal cooling set-point for the next hour. Set-point must be either 74, 76, or 78 Fahrenheit.
+        3. Format your response in to the following format, which is a python dictionary:
         
-        Example Response:
-        {{'optimal_cooling_setpoint': 74, 'rationale': 'Based on historical patterns and predicted temperature, 75.5°F balances energy efficiency and comfort.'}}
+        IMPORTANT: You must ONLY respond with the dictionary. Do not provide any additional text or explanations.
+
+        FORMAT:
+        {{'optimal_cooling_setpoint': "YOUR OPTIMAL SET-POINT (Int)"}}
         """
 
         response = self.model.invoke(prompt_text)
@@ -131,28 +131,105 @@ class phiGPT:
         except Exception as e:
             return {'error': f'Failed to parse response: {str(e)}', 'raw_response': response.content}
 
-    def conduct_24h_control(self, initial_input_features):
-        """Conduct 24-hour HVAC control loop."""
-        control_results = []
-        input_features = initial_input_features.copy()
+    # def conduct_24h_control(self, initial_input_features):
+    #     """Conduct 24-hour HVAC control loop."""
+    #     control_results = []
+    #     input_features = initial_input_features.copy()
 
-        for hour in range(24):
-            setpoint_response = self.generate_optimized_setpoint(self.test_df.iloc[:48][["indoor_air_temperature", "cooling_set_point"]].values.tolist(), input_features)
-            if 'optimal_cooling_setpoint' in setpoint_response:
-                input_features[0] = setpoint_response['optimal_cooling_setpoint']
-                predicted_temp = self.predict_temperature(input_features)
-                control_results.append({'hour': hour + 1, 'setpoint': input_features[0], 'predicted_temp': predicted_temp})
+    #     for hour in range(24):
+    #         setpoint_response = self.generate_optimized_setpoint(self.test_df.iloc[:48][["indoor_air_temperature", "cooling_set_point"]].values.tolist())
+    #         if 'optimal_cooling_setpoint' in setpoint_response:
+    #             input_features[0] = setpoint_response['optimal_cooling_setpoint']
+    #             predicted_temp = self.predict_temperature(input_features)
+    #             control_results.append({'hour': hour + 1, 'setpoint': input_features[0], 'predicted_temp': predicted_temp})
 
-        return control_results
+    #     return control_results
     
+    def conduct_24h_control(self):
+        """
+        Conduct 24-hour HVAC control loop using the test dataset.
+        The first 48 hours of test_df are used for initial state,
+        and control is conducted for the next 24 hours.
+        
+        Returns:
+            list: Control results for each hour
+        """
+        control_results = []
+        
+        # Initialize the 48-hour sliding window from first 48 hours of test data
+        current_48h_series = self.test_df.iloc[:48][["indoor_air_temperature", "cooling_set_point"]].values.tolist()
+        
+        # Initialize current features from the first control timestep (hour 48)
+        current_features = [
+            self.test_df.iloc[48]['cooling_set_point'],      # cooling_set_point
+            self.test_df.iloc[48]['temperature'],            # outdoor temperature
+            self.test_df.iloc[48]['RH'],                     # relative humidity
+            self.test_df.iloc[48]['hour'],                   # hour
+            self.test_df.iloc[48]['day_of_week'],            # day_of_week
+            self.test_df.iloc[47]['indoor_air_temperature'], # lag_1
+            self.test_df.iloc[46]['indoor_air_temperature'], # lag_2
+            self.test_df.iloc[45]['indoor_air_temperature']  # lag_3
+        ]
+        
+        # Control loop for next 24 hours starting from hour 48
+        for hour in range(24):
+            current_hour_idx = 48 + hour  # Start from hour 48 in test_df
+            
+            # Generate optimized setpoint
+            setpoint_response = self.generate_optimized_setpoint(current_48h_series)
+            
+            if 'optimal_cooling_setpoint' in setpoint_response:
+                # Update features from test dataset
+                current_features[1] = self.test_df.iloc[current_hour_idx]['temperature']
+                current_features[2] = self.test_df.iloc[current_hour_idx]['RH']
+                current_features[3] = self.test_df.iloc[current_hour_idx]['hour']
+                current_features[4] = self.test_df.iloc[current_hour_idx]['day_of_week']
+                
+                # Update cooling setpoint from optimization
+                current_features[0] = setpoint_response['optimal_cooling_setpoint']
+                
+                # Predict new indoor temperature
+                predicted_temp = self.predict_temperature(current_features)
+                
+                # Update the sliding window
+                current_48h_series.pop(0)  # Remove oldest hour
+                current_48h_series.append([predicted_temp, setpoint_response['optimal_cooling_setpoint']])
+                
+                # Update temperature lags for next iteration
+                current_features[-1] = current_features[-2]  # Update lag_3 = old lag_2
+                current_features[-2] = current_features[-3]  # Update lag_2 = old lag_1
+                current_features[-3] = predicted_temp        # Update lag_1 = latest prediction
+                
+                # Store results
+                control_results.append({
+                    'hour': hour + 1,
+                    'timestamp': self.test_df.iloc[current_hour_idx]['timestamp'],
+                    'outdoor_temp': current_features[1],
+                    'RH': current_features[2],
+                    'setpoint': setpoint_response['optimal_cooling_setpoint'],
+                    'predicted_temp': predicted_temp,
+                    'actual_temp': self.test_df.iloc[current_hour_idx]['indoor_air_temperature'],  # for comparison
+                    'lags': {
+                        'lag_1': current_features[-3],
+                        'lag_2': current_features[-2],
+                        'lag_3': current_features[-1]
+                    }
+                })
+        
+        return control_results
 
-# hvac_system = phiGPT('./vav_2-356.csv')
 
-# test_df = hvac_system.test_df.iloc[:48]
-# initial_input_features = test_df.iloc[48,1:-1].tolist() 
+hvac_system = phiGPT('./vav_2-356.csv')
 
-# control_results = hvac_system.conduct_24h_control(initial_input_features)
- 
+# test_df = hvac_system.test_df
+# initial_input_features = test_df.iloc[47,1:-1].tolist() 
+# sp = hvac_system.generate_optimized_setpoint(test_df.iloc[:48][["indoor_air_temperature", "cooling_set_point"]].values.tolist(), initial_input_features)
+
+control_results = hvac_system.conduct_24h_control()
+
+retest = test_df.iloc[49,1:-1].tolist()
+a = hvac_system.predict_temperature(retest)
+
 
 # ## 
 
